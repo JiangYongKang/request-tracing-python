@@ -64,7 +64,6 @@ class TracingMiddleware:
         with trace_scope(default_entry) as ctx:
             enable_completion(ctx)
             status_holder: dict[str, int] = {"code": 500}
-            escaped: dict[str, BaseException | None] = {"err": None}
 
             async def send_wrapper(message: Message) -> None:
                 if message["type"] == "http.response.start":
