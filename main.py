@@ -1,8 +1,9 @@
+"""FastAPI application entrypoint."""
 from fastapi import FastAPI
 
-app = FastAPI()
+from app.middleware import TracingMiddleware
+from app.routes import router
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = FastAPI(title="request-tracing-python")
+app.add_middleware(TracingMiddleware)
+app.include_router(router)
