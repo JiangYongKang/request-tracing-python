@@ -513,3 +513,78 @@ def test_interleaved_concurrent_requests_stay_isolated(client) -> None:
         "categories match expectations",
         len(results), len(set(trace_ids)),
     )
+
+
+# --------------------------------------------------------------------------- #
+# 5. Cross-entry consistency and end-to-end aggregation
+# --------------------------------------------------------------------------- #
+def test_same_failure_via_sync_and_async_entries_attributes_same(client) -> None:
+    """The same downstream failure arriving by different entries is equal."""
+    payload_sync = {"item_id": "net-down", "quantity": 1, "amount": 1}
+    payload_async = {"item_id": "net-down", "quantity": 1, "amount": 1}
+    log.info("input sync=%s async=%s (identical downstream fault)",
+             payload_sync, payload_async)
+
+    rs = client.post("/orders", json=payload_sync)
+    ra = client.post("/orders/async", json=payload_async)
+    tid_s, cat_s = _log_conclusion(rs, "sync downstream")
+    tid_a, cat_a = _log_conclusion(ra, "async downstream")
+    assert cat_s == cat_a == "downstream_error"
+    assert rs.status_code == ra.status_code == 502
+    assert rs.json() == ra.json()  # identical public envelope
+    assert tid_s != tid_a  # but distinct requests/traces
+    log.info("attribution identical across entries: %s == %s", cat_s, cat_a)
+
+
+def test_end_to_end_metrics_count_logical_requests_not_attempts(client) -> None:
+    """5 logical orders, one retried internally -> count 5, not 6/7."""
+    inputs = [
+        {"item_id": "widget", "quantity": 1, "amount": 1},                       # ok
+        {"item_id": "widget", "quantity": 1, "amount": 1,
+         "payment_token": "flaky"},                                             # ok after retry
+        {"item_id": "widget", "quantity": 999, "amount": 1},                    # business
+        {"item_id": "net-down", "quantity": 1, "amount": 1},                    # downstream
+        {"item_id": "widget"},                                                  # validation
+    ]
+    for i, payload in enumerate(inputs):
+        log.info("input[%d]: POST /orders payload=%s", i, payload)
+        client.post("/orders", json=payload)
+
+    response = client.get("/metrics")
+    entries = response.json()["entries"]["POST /orders"]
+    log.info(
+        "attribution: count=%d error=%d categories=%s retry_attempts=%d",
+        entries["count"], entries["error_count"],
+        entries["by_category"], entries["retry_attempts"],
+    )
+    assert entries["count"] == 5
+    assert entries["success_count"] == 2
+    assert entries["error_count"] == 3
+    assert entries["by_category"] == {
+        "business_error": 1,
+        "downstream_error": 1,
+        "validation_error": 1,
+    }
+    # Exactly the one flaky payment contributed one extra physical attempt.
+    assert entries["retry_attempts"] == 1
+    # Histogram covers every sample and fixed bounds are reported.
+    assert sum(entries["histogram"]["counts"]) == 5
+    assert entries["histogram"]["bounds_ms"][-1] == 10000
+
+
+def test_background_request_spans_stay_in_own_trace(client) -> None:
+    payload = {"item_id": "widget", "quantity": 1, "amount": 3}
+    log.info("input: POST /orders/background payload=%s", payload)
+    response = client.post("/orders/background", json=payload)
+    trace_id, conclusion = _log_conclusion(response, "background")
+    assert conclusion == "ok"
+    from app.tracer import store
+    record = store.get(trace_id)
+    names = [s["name"] for s in record["spans"]]
+    assert "threadpool_dispatch" in names
+    assert "post_response_hook" in names
+    # every span belongs to this one trace
+    assert len({s["span_id"] for s in record["spans"]}) == len(record["spans"])
+    log.info(
+        "trace_id=%s spans=%s all within one trace", trace_id, names,
+    )

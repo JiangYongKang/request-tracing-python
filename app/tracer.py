@@ -27,7 +27,7 @@ from .context import (
     start_span,
     start_trace,
 )
-from .errors import ClassifiedError, classify
+from .errors import classify
 
 DEFAULT_MAX_TRACES = 512
 
