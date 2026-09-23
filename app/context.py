@@ -13,6 +13,7 @@ Propagation model
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import itertools
 import threading
@@ -30,9 +31,15 @@ _seq = itertools.count(1)
 _current: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(
     "trace_context", default=None
 )
-#: Stack of open span ids on the current execution branch.
+#: Active stack of open span ids on the current execution branch.
 _active_stack: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "active_span_stack", default=()
+)
+#: Error that an inner framework handler converted into a response, so the
+#: outer middleware attributes the trace consistently despite catching
+#: nothing itself.
+_error: contextvars.ContextVar[BaseException | None] = contextvars.ContextVar(
+    "trace_error", default=None
 )
 
 
@@ -87,6 +94,10 @@ class TraceContext:
     spans: list[Span] = field(default_factory=list)
     entry: str | None = None
     created_at: float = 0.0
+    #: Set by middleware so post-response background work can keep appending
+    #: spans; awaited before the trace record is snapshotted & persisted.
+    pending: int = 0
+    completion: asyncio.Event | None = None
 
     def find_span(self, span_id: str) -> Span | None:
         for span in self.spans:
@@ -106,6 +117,15 @@ class TraceContext:
 
 def current_context() -> TraceContext | None:
     return _current.get()
+
+
+def report_error(exc: BaseException) -> None:
+    """Record that an inner handler turned ``exc`` into a response."""
+    _error.set(exc)
+
+
+def reported_error() -> BaseException | None:
+    return _error.get()
 
 
 def current_active_span_id() -> str | None:
@@ -151,6 +171,28 @@ def set_entry_name(entry: str) -> None:
         root = ctx.find_span(ctx.root_span_id)
         if root is not None and root.name == "entry":
             root.name = entry
+
+
+def enable_completion(ctx: TraceContext) -> None:
+    """Attach the completion gate used for post-response background work."""
+    ctx.pending = 0
+    ctx.completion = asyncio.Event()
+
+
+def begin_background() -> None:
+    """Mark one more unit of background work on the current trace."""
+    ctx = _current.get()
+    if ctx is not None and ctx.completion is not None:
+        ctx.pending += 1
+
+
+def end_background() -> None:
+    """Finish one unit; release the gate when all units are done."""
+    ctx = _current.get()
+    if ctx is not None and ctx.completion is not None:
+        ctx.pending = max(0, ctx.pending - 1)
+        if ctx.pending == 0:
+            ctx.completion.set()
 
 
 def start_span(name: str) -> Span:
