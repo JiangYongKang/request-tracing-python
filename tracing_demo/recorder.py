@@ -96,6 +96,20 @@ class TraceRecorder:
                 while len(self._records) > self.max_records:
                     self._records.popitem(last=False)
 
+    def save_if_absent(self, record: TraceRecord) -> bool:
+        """仅当 ``trace_id`` 不存在时保存；返回是否真正新增。
+
+        供导入使用：重复导入同一文件不会变成两份，也不会覆盖或改动
+        环境中已有的追踪数据；新增同样受容量上界约束（FIFO 淘汰）。
+        """
+        with self._lock:
+            if record.trace_id in self._records:
+                return False
+            self._records[record.trace_id] = record
+            while len(self._records) > self.max_records:
+                self._records.popitem(last=False)
+            return True
+
     def get(self, trace_id: str) -> TraceRecord | None:
         with self._lock:
             return self._records.get(trace_id)

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -182,11 +183,11 @@ def _validate_payment(payload: dict) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 # 后台任务：独立线程，沿用同一 trace 上下文
 # ---------------------------------------------------------------------------
-_background_futures: list[threading.Future] = []
+_background_futures: list[concurrent.futures.Future] = []
 _background_lock = threading.Lock()
 
 
-def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threading.Future:
+def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> concurrent.futures.Future:
     """在后台线程执行 ``fn``，绑定入口 trace 的上下文。"""
 
     def _runner() -> None:
@@ -196,7 +197,7 @@ def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threa
         finally:
             detach_trace(token)
 
-    future: threading.Future = threading.Future()
+    future: concurrent.futures.Future = concurrent.futures.Future()
 
     def _target() -> None:
         try:
@@ -218,7 +219,7 @@ def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threa
     return future
 
 
-def background_futures() -> list[threading.Future]:
+def background_futures() -> list[concurrent.futures.Future]:
     """供测试等待后台任务完成。"""
     with _background_lock:
         return list(_background_futures)
