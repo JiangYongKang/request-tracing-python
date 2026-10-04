@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""服务入口：``uvicorn main:app`` 启动本地请求追踪演示服务。"""
+from tracing_demo.app import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
