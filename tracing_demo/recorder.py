@@ -47,8 +47,11 @@ class TraceRecord:
         self.span_lock = span_lock
 
     def to_dict(self) -> dict:
+        # spans 与 errors 在同一把锁下快照：导出/查看时单条链路内部一致，
+        # 不会出现父子关系或失败归因对不上的半份数据。
         with self.span_lock or _null_lock():
             spans_snapshot = list(self.spans)
+            errors_snapshot = list(self.errors)
         return {
             "trace_id": self.trace_id,
             "entry": self.entry,
@@ -68,7 +71,7 @@ class TraceRecord:
                 }
                 for s in spans_snapshot
             ],
-            "errors": [e.to_dict() for e in self.errors],
+            "errors": [e.to_dict() for e in errors_snapshot],
         }
 
 
@@ -95,6 +98,20 @@ class TraceRecorder:
             if not exists:
                 while len(self._records) > self.max_records:
                     self._records.popitem(last=False)
+
+    def save_if_absent(self, record: TraceRecord) -> bool:
+        """仅当 ``trace_id`` 不存在时保存，返回是否真正写入。
+
+        供导入使用：同一 trace 重复导入不会变成两份，也不会覆盖或改动
+        环境中已有的追踪数据；新记录同样受容量上界约束、超出按 FIFO 淘汰。
+        """
+        with self._lock:
+            if record.trace_id in self._records:
+                return False
+            self._records[record.trace_id] = record
+            while len(self._records) > self.max_records:
+                self._records.popitem(last=False)
+            return True
 
     def get(self, trace_id: str) -> TraceRecord | None:
         with self._lock:

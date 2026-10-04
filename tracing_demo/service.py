@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -90,6 +91,8 @@ async def _call_with_retries(
       ``logical_calls``（见 :class:`~tracing_demo.metrics.MetricsRegistry`）；
     - 底层库原始异常在 span 内即包装为 DOWNSTREAM 类别的
       :class:`TracedError`，保证归因一致、原始异常链保留；
+    - 失败的物理尝试其 span 如实标记 ERROR（异常透出 ``use_span``
+      后再决定是否重试），追踪数据与指标口径一致；
     - 重试耗尽后调用 ``fallback``（降级），否则抛出最后一次异常。
     """
     trace_id = current_trace_id()
@@ -97,36 +100,42 @@ async def _call_with_retries(
     last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         is_retry = attempt > 1
-        with use_span(f"{name}#attempt{attempt}" if is_retry else name, attempt=attempt):
-            try:
-                result = fn(*args, attempt=attempt, fail_times=fail_times, **kwargs)
-                if asyncio.iscoroutine(result):
-                    result = await result
-            except TracedError:
-                raise  # 已归因（如业务拒绝），原样向上传播
-            except BaseException as exc:  # 底层库原始异常 -> DOWNSTREAM
-                wrapped = TracedError(
-                    ErrorCategory.DOWNSTREAM,
-                    f"downstream {dependency} unavailable",
-                    cause=exc,
-                )
-                get_metrics().record_dependency(
-                    trace_id or "",
-                    dependency,
-                    logical_key,
-                    is_error=True,
-                    is_retry=is_retry,
-                )
-                last_exc = wrapped
-            else:
-                get_metrics().record_dependency(
-                    trace_id or "",
-                    dependency,
-                    logical_key,
-                    is_error=False,
-                    is_retry=is_retry,
-                )
-                return result
+        try:
+            with use_span(f"{name}#attempt{attempt}" if is_retry else name, attempt=attempt):
+                try:
+                    result = fn(*args, attempt=attempt, fail_times=fail_times, **kwargs)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                except TracedError:
+                    raise  # 已归因（如业务拒绝），原样向上传播，不重试
+                except BaseException as exc:  # 底层库原始异常 -> DOWNSTREAM
+                    wrapped = TracedError(
+                        ErrorCategory.DOWNSTREAM,
+                        f"downstream {dependency} unavailable",
+                        cause=exc,
+                    )
+                    get_metrics().record_dependency(
+                        trace_id or "",
+                        dependency,
+                        logical_key,
+                        is_error=True,
+                        is_retry=is_retry,
+                    )
+                    last_exc = wrapped
+                    raise wrapped  # 透出 use_span：该次尝试的 span 标记 ERROR 与归因
+                else:
+                    get_metrics().record_dependency(
+                        trace_id or "",
+                        dependency,
+                        logical_key,
+                        is_error=False,
+                        is_retry=is_retry,
+                    )
+                    return result
+        except TracedError as exc:
+            if exc is not last_exc:
+                raise  # 已归因的业务/校验错误：不重试，直接上抛
+            # 本次物理尝试失败（span 已记 ERROR），进入下一次重试。
     if fallback is not None:
         with use_span(f"{name}:fallback"):
             return fallback(last_exc)  # type: ignore[arg-type]
@@ -182,11 +191,11 @@ def _validate_payment(payload: dict) -> tuple[str, float]:
 # ---------------------------------------------------------------------------
 # 后台任务：独立线程，沿用同一 trace 上下文
 # ---------------------------------------------------------------------------
-_background_futures: list[threading.Future] = []
+_background_futures: list[concurrent.futures.Future] = []
 _background_lock = threading.Lock()
 
 
-def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threading.Future:
+def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> concurrent.futures.Future:
     """在后台线程执行 ``fn``，绑定入口 trace 的上下文。"""
 
     def _runner() -> None:
@@ -196,7 +205,7 @@ def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threa
         finally:
             detach_trace(token)
 
-    future: threading.Future = threading.Future()
+    future: concurrent.futures.Future = concurrent.futures.Future()
 
     def _target() -> None:
         try:
@@ -218,7 +227,7 @@ def run_in_background(ctx: ctxmod.TraceContext, fn: Callable[[], None]) -> threa
     return future
 
 
-def background_futures() -> list[threading.Future]:
+def background_futures() -> list[concurrent.futures.Future]:
     """供测试等待后台任务完成。"""
     with _background_lock:
         return list(_background_futures)
